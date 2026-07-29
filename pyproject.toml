@@ -44,6 +44,6 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/mycv"
-Documentation = "https://github.com/YOUR_USERNAME/mycv/blob/main/mycv_math_v4.pdf"
-Repository = "https://github.com/YOUR_USERNAME/mycv.git"
+Homepage = "https://github.com/charrlie1/mycv"
+Documentation = "https://github.com/charrlie1/mycv/blob/main/mycv_math_v4.pdf"
+Repository = "https://github.com/charrlie1/mycv.git"
