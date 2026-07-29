@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mycv"
+version = "4.0.0"
+description = "Pure-NumPy computer vision library with mathematical rigor"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Abodunrin Charles Toluwanimi", email = "charlesabodunrin@gmail.com"}
+]
+keywords = ["computer-vision", "numpy", "image-processing", "tracking", "detection"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+demo = [
+    "pygame-ce>=2.0.0",
+    "av>=10.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/mycv"
+Documentation = "https://github.com/YOUR_USERNAME/mycv/blob/main/mycv_math_v4.pdf"
+Repository = "https://github.com/YOUR_USERNAME/mycv.git"
