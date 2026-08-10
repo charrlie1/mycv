@@ -31,6 +31,8 @@ from .tracking   import (
     compute_motion_mask,
     color_mask, calculate_centroid,
     TemporalSmoother,
+    kalman_filter_predict, kalman_filter_update,
+    KalmanCentroidTracker,
 )
 
 __version__ = "4.0.0"
@@ -48,4 +50,6 @@ __all__ = [
     "compute_motion_mask",
     "color_mask", "calculate_centroid",
     "TemporalSmoother",
+    "kalman_filter_predict", "kalman_filter_update",
+    "KalmanCentroidTracker",
 ]

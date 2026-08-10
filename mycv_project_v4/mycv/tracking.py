@@ -9,10 +9,13 @@ Functions
 compute_motion_mask  : Frame-difference binary motion mask
 color_mask           : HSV range filter (replaces cv2.inRange)
 calculate_centroid   : 2-D centre-of-mass of a binary mask
+kalman_filter_predict: Predict next state using Kalman filter
+kalman_filter_update : Update Kalman state with measurement
 
 Classes
 -------
 TemporalSmoother     : Circular-buffer rolling-average denoiser
+KalmanCentroidTracker: Kalman filter for smooth centroid prediction
 
 Mathematical background
 -----------------------
@@ -32,6 +35,12 @@ mean of all foreground pixel positions.
 Temporal smoothing averages the last N frames along the time axis using
 a pre-allocated circular (ring) buffer, which avoids O(N) memory shifts
 on every update and achieves constant-time writes via modulo indexing.
+
+Kalman filtering provides optimal recursive state estimation for linear
+Gaussian systems. For centroid tracking, we model position and velocity
+as a 4-D state vector [x, y, vx, vy] with constant-velocity dynamics.
+The filter alternates between prediction (projecting state forward in
+time) and update (correcting prediction with noisy measurements).
 """
 
 import numpy as np
@@ -356,3 +365,304 @@ class TemporalSmoother:
         """Clear the buffer and reset the frame counter."""
         self._buffer[:] = 0.0
         self._count = 0
+
+
+# ============================================================
+#  4.  Kalman Filter for Centroid Tracking
+# ============================================================
+
+def kalman_filter_predict(
+    state: np.ndarray,
+    P: np.ndarray,
+    F: np.ndarray,
+    Q: np.ndarray,
+) -> tuple:
+    """
+    Predict the next state using the Kalman filter prediction step.
+    
+    Mathematical formulation
+    ------------------------
+    The Kalman filter maintains a Gaussian belief over the state vector
+    characterized by mean (state estimate) and covariance (uncertainty):
+    
+        x_k ~ N(state, P)
+    
+    The prediction step projects this belief forward in time using the
+    state transition model:
+    
+        state_pred = F @ state           (projected state estimate)
+        P_pred     = F @ P @ F.T + Q     (projected covariance)
+    
+    where:
+        - F is the state transition matrix encoding system dynamics
+        - Q is the process noise covariance (model uncertainty)
+    
+    For constant-velocity motion tracking with state [x, y, vx, vy]:
+    
+        F = [[1, 0, dt, 0],      x_new   = x + dt*vx
+             [0, 1, 0, dt],      y_new   = y + dt*vy
+             [0, 0, 1, 0],       vx_new  = vx
+             [0, 0, 0, 1]]       vy_new  = vy
+    
+    Parameters
+    ----------
+    state : np.ndarray  shape (4,) — current state [x, y, vx, vy]
+    P     : np.ndarray  shape (4, 4) — current state covariance
+    F     : np.ndarray  shape (4, 4) — state transition matrix
+    Q     : np.ndarray  shape (4, 4) — process noise covariance
+    
+    Returns
+    -------
+    (state_pred, P_pred) : tuple
+        state_pred : np.ndarray  shape (4,) — predicted state
+        P_pred     : np.ndarray  shape (4, 4) — predicted covariance
+    """
+    # Project state forward: x_pred = F @ x
+    state_pred = F @ state
+    
+    # Project covariance forward: P_pred = F @ P @ F.T + Q
+    P_pred = F @ P @ F.T + Q
+    
+    return state_pred, P_pred
+
+
+def kalman_filter_update(
+    state_pred: np.ndarray,
+    P_pred: np.ndarray,
+    measurement: np.ndarray,
+    H: np.ndarray,
+    R: np.ndarray,
+) -> tuple:
+    """
+    Update the predicted state with a new measurement (Kalman update step).
+    
+    Mathematical formulation
+    ------------------------
+    Given a noisy measurement z related to the state by the observation
+    model z = H @ x + noise, the update step corrects the prediction:
+    
+    Innovation (measurement residual):
+        y = z - H @ state_pred
+    
+    Innovation covariance:
+        S = H @ P_pred @ H.T + R
+    
+    Optimal Kalman gain (minimizes posterior error covariance):
+        K = P_pred @ H.T @ inv(S)
+    
+    Updated state estimate:
+        state = state_pred + K @ y
+    
+    Updated covariance:
+        P = (I - K @ H) @ P_pred
+    
+    The Kalman gain K automatically balances trust between prediction
+    and measurement based on their relative uncertainties (P_pred vs R).
+    
+    Parameters
+    ----------
+    state_pred : np.ndarray  shape (4,) — predicted state from predict()
+    P_pred     : np.ndarray  shape (4, 4) — predicted covariance
+    measurement: np.ndarray  shape (2,) — observed centroid [x, y]
+    H          : np.ndarray  shape (2, 4) — observation matrix
+    R          : np.ndarray  shape (2, 2) — measurement noise covariance
+    
+    Returns
+    -------
+    (state, P) : tuple
+        state : np.ndarray  shape (4,) — updated state estimate
+        P     : np.ndarray  shape (4, 4) — updated covariance
+    """
+    # Compute innovation (residual between measurement and prediction)
+    # y = z - H @ x_pred
+    innovation = measurement - H @ state_pred
+    
+    # Compute innovation covariance: S = H @ P @ H.T + R
+    S = H @ P_pred @ H.T + R
+    
+    # Compute Kalman gain: K = P @ H.T @ inv(S)
+    # Using solve for numerical stability instead of explicit inverse
+    S_inv = np.linalg.inv(S)
+    K = P_pred @ H.T @ S_inv
+    
+    # Update state estimate: x = x_pred + K @ y
+    state = state_pred + K @ innovation
+    
+    # Update covariance: P = (I - K @ H) @ P_pred
+    I = np.eye(state.shape[0])
+    P = (I - K @ H) @ P_pred
+    
+    return state, P
+
+
+class KalmanCentroidTracker:
+    """
+    Track a moving object's centroid using a Kalman filter.
+    
+    Why use a Kalman filter for centroid smoothing?
+    -----------------------------------------------
+    Simple temporal averaging (like TemporalSmoother) treats all frames
+    equally and introduces latency proportional to the window size.
+    In contrast, the Kalman filter:
+    
+    1. Provides optimal recursive estimation for linear-Gaussian systems
+    2. Explicitly models object dynamics (e.g., constant velocity motion)
+    3. Adapts to measurement quality via the Kalman gain
+    4. Can predict position during temporary occlusions (no measurement)
+    5. Has minimal latency — each measurement is processed immediately
+    
+    State-space model
+    -----------------
+    We use a 4-D state vector representing 2D position and velocity:
+    
+        state = [x, y, vx, vy]^T
+    
+    The constant-velocity motion model assumes:
+        x(t+dt)  = x(t) + dt * vx(t)
+        y(t+dt)  = y(t) + dt * vy(t)
+        vx(t+dt) = vx(t)
+        vy(t+dt) = vy(t)
+    
+    This yields the state transition matrix F (for dt=1):
+        F = [[1, 0, 1, 0],
+             [0, 1, 0, 1],
+             [0, 0, 1, 0],
+             [0, 0, 0, 1]]
+    
+    The observation matrix H extracts only position from the state:
+        H = [[1, 0, 0, 0],      [x]     [x]
+             [0, 1, 0, 0]]  =>  [y]  =  [y]
+    
+    Tuning parameters
+    -----------------
+    process_noise (Q): Controls how much we expect the target to deviate
+                       from constant-velocity motion. Higher values make
+                       the filter more responsive to sudden accelerations.
+    
+    measurement_noise (R): Represents expected centroid detection noise.
+                          Higher values make the filter trust predictions
+                          more than measurements (smoother but laggy).
+    
+    Parameters
+    ----------
+    process_noise    : float  variance of process noise (default: 1e-3)
+    measurement_noise: float  variance of measurement noise (default: 1e-1)
+    dt               : float  time step between frames (default: 1.0)
+    """
+    
+    def __init__(
+        self,
+        process_noise: float = 1e-3,
+        measurement_noise: float = 1e-1,
+        dt: float = 1.0,
+    ) -> None:
+        if process_noise <= 0:
+            raise ValueError("process_noise must be positive.")
+        if measurement_noise <= 0:
+            raise ValueError("measurement_noise must be positive.")
+        
+        self.dt = dt
+        
+        # State vector: [x, y, vx, vy]
+        self.state = np.zeros(4, dtype=np.float64)
+        
+        # State covariance (initial uncertainty)
+        self.P = np.eye(4, dtype=np.float64) * 1.0
+        
+        # State transition matrix (constant velocity model)
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float64)
+        
+        # Observation matrix (we only observe position, not velocity)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=np.float64)
+        
+        # Process noise covariance
+        self.Q = np.eye(4, dtype=np.float64) * process_noise
+        
+        # Measurement noise covariance
+        self.R = np.eye(2, dtype=np.float64) * measurement_noise
+        
+        self._initialized = False
+        self._prediction_cache = None
+    
+    def initialize(self, initial_centroid: tuple) -> None:
+        """
+        Initialize the filter with an initial centroid measurement.
+        
+        Parameters
+        ----------
+        initial_centroid : tuple  (x, y) — first detected centroid
+        """
+        self.state[0] = initial_centroid[0]  # x
+        self.state[1] = initial_centroid[1]  # y
+        self.state[2] = 0.0                   # vx (unknown initially)
+        self.state[3] = 0.0                   # vy (unknown initially)
+        self._initialized = True
+        self._prediction_cache = None
+    
+    def update(self, centroid: tuple) -> tuple:
+        """
+        Update the tracker with a new centroid measurement.
+        
+        Performs both prediction and update steps of the Kalman filter.
+        
+        Parameters
+        ----------
+        centroid : tuple  (x, y) — measured centroid position
+        
+        Returns
+        -------
+        (x, y) : tuple  smoothed/predicted centroid position
+        """
+        measurement = np.array(centroid, dtype=np.float64)
+        
+        if not self._initialized:
+            # First measurement: initialize and return it
+            self.initialize(centroid)
+            return centroid
+        
+        # Prediction step
+        state_pred, P_pred = kalman_filter_predict(
+            self.state, self.P, self.F, self.Q
+        )
+        
+        # Update step
+        self.state, self.P = kalman_filter_update(
+            state_pred, P_pred, measurement, self.H, self.R
+        )
+        
+        return (self.state[0], self.state[1])
+    
+    def predict(self) -> tuple:
+        """
+        Predict the next centroid position without a new measurement.
+        
+        Useful for handling temporary occlusions or dropped frames.
+        Only performs the prediction step (no measurement update).
+        
+        Returns
+        -------
+        (x, y) : tuple  predicted centroid position
+        """
+        if not self._initialized:
+            return (-1, -1)
+        
+        state_pred, _ = kalman_filter_predict(
+            self.state, self.P, self.F, self.Q
+        )
+        
+        return (state_pred[0], state_pred[1])
+    
+    def reset(self) -> None:
+        """Reset the tracker to its initial uninitialized state."""
+        self.state = np.zeros(4, dtype=np.float64)
+        self.P = np.eye(4, dtype=np.float64) * 1.0
+        self._initialized = False
+        self._prediction_cache = None
