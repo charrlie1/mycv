@@ -1,16 +1,3 @@
---- .gitignore (原始)
-```
-# Image outputs
-*.jpg
-*.jpeg
-*.png
-*.bmp
-*.gif
-*.webm
-```
-
-+++ .gitignore (修改后)
-```
 # Python
 __pycache__/
 *.pyc
@@ -18,5 +5,4 @@ __pycache__/
 *.pyd
 
 # Image outputs
-mycv_project_v4/output_*.jpg
-```
+output_*.jpg
