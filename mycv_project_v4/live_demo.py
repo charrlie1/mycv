@@ -2,62 +2,24 @@
 """
 live_demo.py
 
-Real-time demonstration driver for the mycv pure-NumPy computer-vision library.
+Updated real-time demonstration driver for mycv v4.1.
 
-This script provides a live video I/O layer and interactive visualisation for:
+Integrates:
 
-    - colour-based tracking
-    - frame-difference motion tracking
-    - normalised cross-correlation template detection
+    - colour tracking
+    - motion tracking
+    - template detection
+    - multi-scale template detection
+    - connected-component labelling
+    - component properties
+    - single-object Kalman tracking
+    - multi-object Kalman tracking
+    - bounding-box extraction and drawing
+    - object classification
+    - optional Harris corner and Hough line feature counting
+    - optional mycv.streaming.StreamReader for files, RTSP, HTTP, UDP, etc.
 
-It intentionally avoids OpenCV for all mathematical image processing.
-
-Supported sources
------------------
-
-    --source synthetic
-        Generated moving square. Useful for testing.
-
-    --source camera
-        First available webcam through pygame.camera.
-
-    --source 0, --source 1, ...
-        Specific webcam index through pygame.camera.
-
-    --source video.mp4
-        Video file through PyAV.
-
-    --source "dshow:video=Integrated Camera"
-        Windows DirectShow device through PyAV / FFmpeg.
-
-    --source "v4l2:/dev/video0"
-        Linux V4L2 device through PyAV / FFmpeg.
-
-    --source "avfoundation:0:1"
-        macOS AVFoundation device through PyAV / FFmpeg.
-
-Controls
---------
-
-    q / Esc     quit
-    c           colour-tracking mode
-    m           motion-tracking mode
-    t           capture centre template and enter template-detection mode
-    d           enter template-detection mode
-    s           sample colour from centre pixel region
-    g           green colour preset
-    r           red colour preset, with hue wrap-around
-    b           blue colour preset
-    y           yellow colour preset
-    o           toggle mask overlay
-    p           toggle morphological cleanup
-    = / +       increase detection threshold
-    -           decrease detection threshold
-    [           decrease motion threshold
-    ]           increase motion threshold
-    left        decrease template size
-    right       increase template size
-    h           print help
+No OpenCV is used for image mathematics.
 """
 
 from __future__ import annotations
@@ -74,19 +36,56 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from mycv.core import rgb_to_grayscale
-from mycv.color import rgb_to_hsv
-from mycv.morphology import opening, closing
-from mycv.tracking import (
-    compute_motion_mask,
-    color_mask,
-    calculate_centroid,
-    TemporalSmoother,
-)
-from mycv.detection import (
-    match_template_ncc,
-    find_template_matches,
-)
+try:
+    from mycv.core import rgb_to_grayscale
+    from mycv.color import rgb_to_hsv
+    from mycv.filters import sobel_edge_detection
+    from mycv.morphology import (
+        opening,
+        closing,
+        label_connected_components,
+        component_properties,
+    )
+    from mycv.features import (
+        extract_object_metrics,
+        draw_bounding_box,
+        classify_object,
+    )
+    from mycv.tracking import (
+        compute_motion_mask,
+        color_mask_hue_wrap,
+        calculate_centroid,
+        TemporalSmoother,
+        KalmanCentroidTracker,
+        MultiObjectKalmanTracker,
+    )
+    from mycv.detection import (
+        match_template_ncc,
+        match_template_ncc_multiscale,
+        find_template_matches,
+    )
+
+except Exception as exc:
+    print("Failed to import mycv modules.")
+    print()
+    print("Common causes:")
+    print("  1. mycv/__init__.py contains raw uncommented text.")
+    print("  2. mycv/__init__.py uses 'all' instead of '__all__'.")
+    print("  3. Exported names in __all__ contain trailing spaces.")
+    print("  4. A module file is missing or has a syntax error.")
+    print()
+    print(f"Import error: {exc}")
+    raise SystemExit(1)
+
+
+try:
+    from mycv.streaming import StreamReader
+    STREAMING_AVAILABLE = True
+    STREAMING_ERROR = None
+except Exception as exc:
+    StreamReader = None
+    STREAMING_AVAILABLE = False
+    STREAMING_ERROR = exc
 
 
 try:
@@ -101,20 +100,9 @@ except Exception as exc:
     PYGAME_ERROR = exc
 
 
-try:
-    import av
-
-    PYAV_AVAILABLE = True
-    PYAV_ERROR = None
-except Exception as exc:
-    av = None
-    PYAV_AVAILABLE = False
-    PYAV_ERROR = exc
-
-
 HELP_TEXT = """
-mycv live demo
-==============
+mycv live demo v4.1
+===================
 
 Modes:
     c       colour tracking
@@ -129,7 +117,16 @@ Colour controls:
     b       blue preset
     y       yellow preset
 
-Detection / motion controls:
+Tracking controls:
+    k       toggle Kalman filtering
+    u       toggle multi-object tracking
+    i       toggle object bounding box + classification
+    o       toggle mask overlay
+    p       toggle morphological cleanup
+    f       toggle corner/line feature counting
+
+Detection controls:
+    n       toggle multi-scale template matching
     = / +   increase detection threshold
     -       decrease detection threshold
     [       decrease motion threshold
@@ -137,17 +134,16 @@ Detection / motion controls:
     left    decrease template size
     right   increase template size
 
-Display controls:
-    o       toggle mask overlay
-    p       toggle morphological cleanup
+Other:
     h       print help
     q/Esc   quit
 
-Example source strings:
+Example sources:
     --source synthetic
     --source camera
     --source 0
     --source video.mp4
+    --source "rtsp://192.168.1.100:554/stream"
     --source "dshow:video=Integrated Camera"
     --source "v4l2:/dev/video0"
     --source "avfoundation:0:1"
@@ -155,15 +151,14 @@ Example source strings:
 
 
 # ---------------------------------------------------------------------------
-# Small numerical helpers
+# Numerical helpers
 # ---------------------------------------------------------------------------
-def resize_nearest(image: np.ndarray, max_dim: int) -> np.ndarray:
+def resize_nearest(image, max_dim):
     """
-    Downscale an image using nearest-neighbour sampling.
+    Downscale with nearest-neighbour sampling.
 
-    This is intentionally simple and dependency-free. It is used to keep
-    real-time template matching tractable, because full-resolution NCC is
-    memory-intensive and computationally expensive.
+    This keeps connected-component labelling, NCC, and feature extraction
+    tractable in real time.
     """
 
     if max_dim is None or max_dim < 8:
@@ -185,14 +180,9 @@ def resize_nearest(image: np.ndarray, max_dim: int) -> np.ndarray:
     return image[rows[:, None], cols[None, :]]
 
 
-def to_uint8_rgb(image: np.ndarray) -> np.ndarray:
+def to_uint8_rgb(image):
     """
-    Normalise an incoming frame to uint8 RGB.
-
-    Handles:
-        - grayscale images,
-        - floating-point images in [0, 1],
-        - numeric arrays needing clipping.
+    Convert an incoming frame to uint8 RGB.
     """
 
     img = np.asarray(image)
@@ -214,82 +204,22 @@ def to_uint8_rgb(image: np.ndarray) -> np.ndarray:
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def hsv_mask_wrapped(
-    hsv_image: np.ndarray,
-    lower_bound: np.ndarray,
-    upper_bound: np.ndarray,
-) -> np.ndarray:
+def confidence_from_area(area, H, W):
     """
-    HSV range mask with support for hue wrap-around.
+    Convert object pixel area into a Kalman confidence value in (0, 1].
 
-    mycv.tracking.color_mask performs a single axis-aligned HSV box query.
-    Red-like colours often require two intervals because hue is periodic:
-
-        [0, 20] union [340, 360]
-
-    This helper splits the query automatically when necessary.
+    A very small mask usually produces a noisy centroid, so its measurement
+    should be trusted less. A mask occupying about 0.5% of the frame or
+    more receives full confidence.
     """
 
-    lower = np.asarray(lower_bound, dtype=np.float32).copy()
-    upper = np.asarray(upper_bound, dtype=np.float32).copy()
+    frame_area = float(max(1, H * W))
+    fraction = float(area) / frame_area
 
-    # Clamp saturation and value to their valid physical range.
-    for channel in (1, 2):
-        lower[channel] = float(np.clip(lower[channel], 0.0, 1.0))
-        upper[channel] = float(np.clip(upper[channel], 0.0, 1.0))
+    confidence = fraction / 0.005
+    confidence = float(np.clip(confidence, 0.10, 1.0))
 
-    # Bring hue bounds into a more manageable range.
-    while upper[0] < 0.0:
-        lower[0] += 360.0
-        upper[0] += 360.0
-
-    while lower[0] > 360.0:
-        lower[0] -= 360.0
-        upper[0] -= 360.0
-
-    # Explicit inverted interval, e.g. [330, 30].
-    if lower[0] > upper[0]:
-        mask_a = color_mask(
-            hsv_image,
-            np.array([lower[0], lower[1], lower[2]], dtype=np.float32),
-            np.array([360.0, upper[1], upper[2]], dtype=np.float32),
-        )
-        mask_b = color_mask(
-            hsv_image,
-            np.array([0.0, lower[1], lower[2]], dtype=np.float32),
-            np.array([upper[0], upper[1], upper[2]], dtype=np.float32),
-        )
-        return np.maximum(mask_a, mask_b)
-
-    # Lower hue below zero, e.g. [-15, 15].
-    if lower[0] < 0.0:
-        mask_a = color_mask(
-            hsv_image,
-            np.array([0.0, lower[1], lower[2]], dtype=np.float32),
-            np.array([upper[0], upper[1], upper[2]], dtype=np.float32),
-        )
-        mask_b = color_mask(
-            hsv_image,
-            np.array([lower[0] + 360.0, lower[1], lower[2]], dtype=np.float32),
-            np.array([360.0, upper[1], upper[2]], dtype=np.float32),
-        )
-        return np.maximum(mask_a, mask_b)
-
-    # Upper hue above 360, e.g. [350, 370].
-    if upper[0] > 360.0:
-        mask_a = color_mask(
-            hsv_image,
-            np.array([lower[0], lower[1], lower[2]], dtype=np.float32),
-            np.array([360.0, upper[1], upper[2]], dtype=np.float32),
-        )
-        mask_b = color_mask(
-            hsv_image,
-            np.array([0.0, lower[1], lower[2]], dtype=np.float32),
-            np.array([upper[0] - 360.0, upper[1], upper[2]], dtype=np.float32),
-        )
-        return np.maximum(mask_a, mask_b)
-
-    return color_mask(hsv_image, lower, upper)
+    return confidence
 
 
 # ---------------------------------------------------------------------------
@@ -297,26 +227,22 @@ def hsv_mask_wrapped(
 # ---------------------------------------------------------------------------
 class SyntheticSource:
     """
-    Synthetic moving-square source.
-
-    This is useful for verifying that the full pipeline works without
-    requiring camera permissions, a display camera backend, or a video file.
+    Synthetic moving square for testing.
     """
 
-    def __init__(self, width: int = 320, height: int = 240, fps: int = 30) -> None:
+    def __init__(self, width=320, height=240, fps=30):
         self.width = int(width)
         self.height = int(height)
         self.fps = float(fps)
         self.t = 0
         self.rng = np.random.default_rng(0)
 
-    def read(self) -> np.ndarray:
+    def read(self):
         H = self.height
         W = self.width
 
         img = np.zeros((H, W, 3), dtype=np.uint8)
 
-        # Dark background.
         img[..., 0] = 18
         img[..., 1] = 20
         img[..., 2] = 26
@@ -327,31 +253,25 @@ class SyntheticSource:
         max_x = max(1, W - square)
         x = int((self.t * 3) % max_x)
 
-        # Green square.
         img[y:y + square, x:x + square] = (55, 220, 85)
 
-        # Mild noise.
         noise = self.rng.integers(-6, 7, size=img.shape, dtype=np.int16)
         img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
         self.t += 1
 
-        return img
+        return img, time.perf_counter()
 
-    def close(self) -> None:
+    def close(self):
         pass
 
 
 class PygameCameraSource:
     """
-    Webcam source using pygame.camera.
-
-    This is the simplest pure-Python-friendly webcam route for many desktop
-    systems, but it is platform-dependent. If it fails, use a PyAV device
-    source such as dshow, v4l2, or avfoundation.
+    Webcam source through pygame.camera.
     """
 
-    def __init__(self, device: int | str = 0, width: int = 320, height: int = 240, fps: int = 30) -> None:
+    def __init__(self, device=0, width=320, height=240, fps=30):
         if not PYGAME_AVAILABLE:
             raise RuntimeError(
                 f"pygame is not available. Install pygame-ce or pygame. Details: {PYGAME_ERROR}"
@@ -380,7 +300,6 @@ class PygameCameraSource:
         try:
             self.cam = pygame.camera.Camera(device_path, (int(width), int(height)), "RGB")
         except Exception:
-            # Fall back to the camera's default size and colourspace.
             self.cam = pygame.camera.Camera(device_path)
 
         self.cam.start()
@@ -388,7 +307,7 @@ class PygameCameraSource:
         self.width = int(width)
         self.height = int(height)
 
-    def read(self) -> np.ndarray | None:
+    def read(self):
         try:
             surface = self.cam.get_image()
             w, h = surface.get_size()
@@ -398,12 +317,12 @@ class PygameCameraSource:
             self.width = w
             self.height = h
 
-            return frame
+            return frame, time.perf_counter()
 
         except Exception:
-            return None
+            return None, None
 
-    def close(self) -> None:
+    def close(self):
         try:
             self.cam.stop()
         except Exception:
@@ -415,141 +334,61 @@ class PygameCameraSource:
             pass
 
 
-class PyAVVideoSource:
+class StreamSource:
     """
-    Video-file source using PyAV.
+    Video-file / network-stream / FFmpeg-device source through mycv.streaming.
 
-    This decodes compressed video through FFmpeg and returns RGB NumPy arrays.
+    This uses mycv.streaming.StreamReader, which requires the optional `av`
+    package. It supports local files, RTSP, HTTP, HTTPS, UDP, RTP, and
+    FFmpeg device strings such as:
+
+        dshow:video=Integrated Camera
+        v4l2:/dev/video0
+        avfoundation:0:1
     """
 
-    def __init__(self, path: str | Path) -> None:
-        if not PYAV_AVAILABLE:
+    def __init__(self, url, rtsp_transport="tcp", timeout_us=5_000_000, reconnect_delay=2.0):
+        if not STREAMING_AVAILABLE:
             raise RuntimeError(
-                f"PyAV is not available. Install it with: python -m pip install av. Details: {PYAV_ERROR}"
+                "mycv.streaming.StreamReader is unavailable because the optional "
+                f"'av' package is missing or failed to import. Details: {STREAMING_ERROR}"
             )
 
-        self.path = str(path)
-        self._open()
+        self.reader = StreamReader(
+            url=url,
+            rtsp_transport=rtsp_transport,
+            timeout_us=timeout_us,
+            reconnect_delay=reconnect_delay,
+        ).start()
 
-    def _open(self) -> None:
-        self.container = av.open(self.path)
-        self.stream = self.container.streams.video[0]
-        self.stream.thread_type = "AUTO"
+        self.fps = 30.0
 
-        self._decoder = self.container.decode(video=0)
+    def read(self):
+        frame, timestamp = self.reader.read(timeout=1.0)
+        return frame, timestamp
 
-        self.width = int(self.stream.codec_context.width)
-        self.height = int(self.stream.codec_context.height)
-
-        rate = self.stream.average_rate
-        self.fps = float(rate) if rate is not None else 30.0
-
-    def read(self) -> np.ndarray | None:
-        while True:
-            try:
-                frame = next(self._decoder)
-
-            except StopIteration:
-                # Loop the video for demonstration purposes.
-                self.container.close()
-                self._open()
-                continue
-
-            except Exception:
-                return None
-
-            if frame is None:
-                continue
-
-            rgb = frame.to_ndarray(format="rgb24")
-            self.height, self.width = rgb.shape[:2]
-
-            return rgb
-
-    def close(self) -> None:
+    def close(self):
         try:
-            self.container.close()
+            self.reader.stop()
         except Exception:
             pass
 
 
-class PyAVDeviceSource:
-    """
-    Live device source using PyAV / FFmpeg input devices.
-
-    Examples:
-        Windows:
-            dshow:video=Integrated Camera
-
-        Linux:
-            v4l2:/dev/video0
-
-        macOS:
-            avfoundation:0:1
-    """
-
-    def __init__(
-        self,
-        fmt: str,
-        device: str,
-        width: int = 320,
-        height: int = 240,
-        fps: int = 30,
-    ) -> None:
-        if not PYAV_AVAILABLE:
-            raise RuntimeError(
-                f"PyAV is not available. Install it with: python -m pip install av. Details: {PYAV_ERROR}"
-            )
-
-        self.fmt = fmt
-        self.device = device
-        self.fps = float(fps)
-        self.width = int(width)
-        self.height = int(height)
-
-        options = {
-            "framerate": str(int(fps)),
-            "video_size": f"{int(width)}x{int(height)}",
-        }
-
-        if fmt == "dshow" and not device.startswith(("video=", "audio=")):
-            device = f"video={device}"
-
-        try:
-            self.container = av.open(device, format=fmt, options=options)
-        except Exception:
-            # Some devices reject the requested options; retry with defaults.
-            self.container = av.open(device, format=fmt)
-
-        self.stream = self.container.streams.video[0]
-        self.stream.thread_type = "AUTO"
-
-        self._decoder = self.container.decode(video=0)
-
-    def read(self) -> np.ndarray | None:
-        try:
-            frame = next(self._decoder)
-        except Exception:
-            return None
-
-        if frame is None:
-            return None
-
-        rgb = frame.to_ndarray(format="rgb24")
-        self.height, self.width = rgb.shape[:2]
-
-        return rgb
-
-    def close(self) -> None:
-        try:
-            self.container.close()
-        except Exception:
-            pass
-
-
-def make_source(source: str, width: int, height: int, fps: int):
+def make_source(source, width, height, fps):
     """
     Construct the requested frame source.
+
+    Source strings:
+
+        synthetic
+        camera
+        0, 1, 2, ...
+        video.mp4
+        rtsp://...
+        http://...
+        dshow:video=Camera Name
+        v4l2:/dev/video0
+        avfoundation:0:1
     """
 
     source = str(source)
@@ -563,28 +402,7 @@ def make_source(source: str, width: int, height: int, fps: int):
     if source.isdigit():
         return PygameCameraSource(device=int(source), width=width, height=height, fps=fps)
 
-    path = Path(source).expanduser()
-    if path.exists():
-        return PyAVVideoSource(path)
-
-    if ":" in source:
-        fmt, _, device = source.partition(":")
-        fmt = fmt.lower()
-
-        if fmt in {"dshow", "v4l2", "avfoundation", "gdigrab"}:
-            return PyAVDeviceSource(
-                fmt=fmt,
-                device=device,
-                width=width,
-                height=height,
-                fps=fps,
-            )
-
-    raise ValueError(
-        f"Unknown source '{source}'. Use synthetic, camera, an integer camera index, "
-        "a video-file path, or an FFmpeg device string such as "
-        "'dshow:video=Integrated Camera'."
-    )
+    return StreamSource(source)
 
 
 # ---------------------------------------------------------------------------
@@ -592,25 +410,32 @@ def make_source(source: str, width: int, height: int, fps: int):
 # ---------------------------------------------------------------------------
 class VisionPipeline:
     """
-    Unified tracking and detection pipeline.
-
-    Modes:
-        colour      HSV mask, morphology, centroid
-        motion      frame differencing, morphology, centroid
-        template    NCC template matching, NMS, bounding boxes
+    Unified real-time pipeline for mycv v4.1.
     """
 
     def __init__(
         self,
-        mode: str = "color",
-        max_dim: int = 180,
-        smooth_frames: int = 0,
-        template_size: int = 28,
-        detection_threshold: float = 0.55,
-        motion_threshold: int = 25,
-        detect_every: int = 1,
-        use_morphology: bool = True,
-    ) -> None:
+        mode="color",
+        max_dim=180,
+        smooth_frames=0,
+        template_size=28,
+        detection_threshold=0.55,
+        motion_threshold=25,
+        detect_every=1,
+        use_morphology=True,
+        enable_kalman=True,
+        enable_object_info=True,
+        multi_object=False,
+        use_multiscale=False,
+        multiscale_levels=3,
+        feature_counts=False,
+        process_noise=1e-2,
+        measurement_noise=1e-1,
+        gate_threshold=0.0,
+        min_area=20,
+        max_match_distance=50.0,
+        max_missed=5,
+    ):
         self.mode = mode
         self.max_dim = int(max_dim)
         self.smooth_frames = int(smooth_frames)
@@ -618,29 +443,96 @@ class VisionPipeline:
         self.detection_threshold = float(detection_threshold)
         self.motion_threshold = int(motion_threshold)
         self.detect_every = max(1, int(detect_every))
+
         self.use_morphology = bool(use_morphology)
+        self.use_kalman = bool(enable_kalman)
+        self.show_object_info = bool(enable_object_info)
+        self.multi_object = bool(multi_object)
+        self.use_multiscale = bool(use_multiscale)
+        self.multiscale_levels = int(multiscale_levels)
+        self.feature_counts = bool(feature_counts)
+
+        self.min_area = int(min_area)
+        self.max_match_distance = float(max_match_distance)
+        self.max_missed = int(max_missed)
+
+        gate = None
+        if gate_threshold is not None and float(gate_threshold) > 0:
+            gate = float(gate_threshold)
+
+        self.single_tracker = KalmanCentroidTracker(
+            process_noise=process_noise,
+            measurement_noise=measurement_noise,
+            dt=1.0,
+            gate_threshold=gate,
+        )
+
+        self.multi_tracker = MultiObjectKalmanTracker(
+            max_match_distance=self.max_match_distance,
+            max_missed=self.max_missed,
+            process_noise=process_noise,
+            measurement_noise=measurement_noise,
+            dt=1.0,
+        )
 
         # Default green HSV bounds.
         self.lower_bound = np.array([70.0, 0.25, 0.25], dtype=np.float32)
         self.upper_bound = np.array([170.0, 1.0, 1.0], dtype=np.float32)
 
-        self.smoother: TemporalSmoother | None = None
-        self.prev_gray: np.ndarray | None = None
-        self.template: np.ndarray | None = None
+        self.smoother = None
+        self.prev_gray = None
+        self.template = None
 
         self.frame_count = 0
 
-        self.display_rgb: np.ndarray | None = None
-        self.gray: np.ndarray | None = None
-        self.mask: np.ndarray | None = None
+        self.display_rgb = None
+        self.gray = None
+        self.mask = None
 
-        self.centroid: tuple[float, float] = (-1.0, -1.0)
+        self.components = []
+        self.selected_mask = None
+
+        self.centroid = (-1.0, -1.0)
+        self.track_positions = {}
+        self.raw_detections = []
+
         self.boxes = np.empty((0, 4), dtype=np.float64)
         self.scores = np.empty((0,), dtype=np.float64)
 
+        self.object_metrics = None
+        self.object_label = ""
+        self.object_bbox = None
+
+        self.lost_frames = 0
+        self._last_mode = None
+
         self.last_error = ""
 
-    def _ensure_smoother(self, rgb: np.ndarray) -> None:
+    def set_mode(self, mode):
+        """
+        Change pipeline mode and reset temporal tracking state.
+        """
+
+        if mode == self.mode:
+            return
+
+        self.mode = mode
+
+        self.single_tracker.reset()
+        self.multi_tracker.reset()
+
+        self.components = []
+        self.selected_mask = None
+        self.track_positions = {}
+        self.raw_detections = []
+
+        self.object_metrics = None
+        self.object_label = ""
+        self.object_bbox = None
+
+        self.lost_frames = 0
+
+    def _ensure_smoother(self, rgb):
         if self.smooth_frames <= 1:
             self.smoother = None
             return
@@ -660,13 +552,17 @@ class VisionPipeline:
                 channels=C,
             )
 
-    def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
+    def _clean_mask(self, mask):
         if not self.use_morphology:
             return mask
 
         return closing(opening(mask))
 
-    def set_color_preset(self, name: str) -> None:
+    def set_color_preset(self, name):
+        """
+        Apply a simple HSV colour preset.
+        """
+
         name = name.lower()
 
         if name == "green":
@@ -674,7 +570,6 @@ class VisionPipeline:
             self.upper_bound = np.array([170.0, 1.0, 1.0], dtype=np.float32)
 
         elif name == "red":
-            # Negative hue is handled by hsv_mask_wrapped.
             self.lower_bound = np.array([-20.0, 0.30, 0.20], dtype=np.float32)
             self.upper_bound = np.array([20.0, 1.0, 1.0], dtype=np.float32)
 
@@ -689,13 +584,15 @@ class VisionPipeline:
         else:
             raise ValueError(f"Unknown colour preset: {name}")
 
-    def sample_color_from_center(
-        self,
-        rgb: np.ndarray | None = None,
-        tol_h: float = 18.0,
-        tol_s: float = 0.25,
-        tol_v: float = 0.25,
-    ) -> bool:
+        self.single_tracker.reset()
+        self.multi_tracker.reset()
+        self.lost_frames = 0
+
+    def sample_color_from_center(self, rgb=None, tol_h=18.0, tol_s=0.25, tol_v=0.25):
+        """
+        Sample a small centre patch and set HSV bounds from its mean HSV.
+        """
+
         if rgb is None:
             rgb = self.display_rgb
 
@@ -739,9 +636,17 @@ class VisionPipeline:
             dtype=np.float32,
         )
 
+        self.single_tracker.reset()
+        self.multi_tracker.reset()
+        self.lost_frames = 0
+
         return True
 
-    def capture_template(self) -> bool:
+    def capture_template(self):
+        """
+        Capture a centre template from the current processed grayscale frame.
+        """
+
         if self.gray is None:
             return False
 
@@ -760,9 +665,127 @@ class VisionPipeline:
         self.template_size = ts
         self.last_error = ""
 
+        self.single_tracker.reset()
+        self.multi_tracker.reset()
+        self.lost_frames = 0
+
         return True
 
-    def process(self, rgb: np.ndarray) -> "VisionPipeline":
+    def _component_detections(self, mask, rgb):
+        """
+        Label connected components and return component properties.
+        """
+
+        labels, num_labels = label_connected_components(mask, connectivity=8)
+
+        if num_labels == 0:
+            return [], None
+
+        props = component_properties(labels, num_labels, image=rgb)
+
+        props = [p for p in props if p["pixel_area"] >= self.min_area]
+
+        if not props:
+            return [], None
+
+        props.sort(key=lambda p: p["pixel_area"], reverse=True)
+
+        selected_label = props[0]["label"]
+        selected_mask = (labels == selected_label)
+
+        return props, selected_mask
+
+    def _update_object_info(self, rgb, gray):
+        """
+        Extract bounding-box metrics and classify the current selected object.
+        """
+
+        self.object_metrics = None
+        self.object_label = ""
+        self.object_bbox = None
+
+        if not self.show_object_info:
+            return
+
+        # -------------------------------------------------------------------
+        # Mask-based modes: colour or motion.
+        # -------------------------------------------------------------------
+        if self.mode in {"color", "motion"} and self.selected_mask is not None:
+            Gx = None
+            Gy = None
+            edges = None
+
+            if self.feature_counts:
+                sob = sobel_edge_detection(gray)
+                Gx = sob["Gx"]
+                Gy = sob["Gy"]
+
+                mag = sob["magnitude"]
+                edge_thresh = max(15, int(mag.max() * 0.25))
+                edges = (mag >= edge_thresh).astype(np.uint8) * 255
+
+            metrics = extract_object_metrics(
+                self.selected_mask,
+                Gx=Gx,
+                Gy=Gy,
+                edges=edges,
+            )
+
+            if metrics is not None:
+                self.object_metrics = metrics
+                self.object_bbox = metrics["bbox"]
+
+                try:
+                    self.object_label = classify_object(
+                        rgb,
+                        metrics,
+                        mask=self.selected_mask,
+                    )
+                except Exception:
+                    self.object_label = "Unknown"
+
+            return
+
+        # -------------------------------------------------------------------
+        # Template mode: use best detection as an approximate object box.
+        # -------------------------------------------------------------------
+        if self.mode == "template" and len(self.boxes) > 0:
+            y1, x1, y2, x2 = map(int, self.boxes[0])
+
+            y2 = max(y2, y1 + 1)
+            x2 = max(x2, x1 + 1)
+
+            width = x2 - x1
+            height = y2 - y1
+
+            aspect_ratio = width / height if height > 0 else 0.0
+
+            metrics = {
+                "bbox": (y1, x1, y2, x2),
+                "bbox_width": width,
+                "bbox_height": height,
+                "bbox_area": width * height,
+                "pixel_area": width * height,
+                "aspect_ratio": aspect_ratio,
+                "centroid": (
+                    float(x1 + x2) * 0.5,
+                    float(y1 + y2) * 0.5,
+                ),
+            }
+
+            self.object_metrics = metrics
+            self.object_bbox = metrics["bbox"]
+
+            try:
+                self.object_label = classify_object(rgb, metrics, mask=None)
+            except Exception:
+                self.object_label = "Template"
+
+    def process(self, rgb, timestamp=None):
+        """
+        Process one RGB frame.
+        """
+
         if rgb is None:
             return self
 
@@ -776,6 +799,12 @@ class VisionPipeline:
 
         gray = rgb_to_grayscale(rgb)
 
+        if self.mode != self._last_mode:
+            self.single_tracker.reset()
+            self.multi_tracker.reset()
+            self.lost_frames = 0
+            self._last_mode = self.mode
+
         self.frame_count += 1
 
         self.display_rgb = rgb
@@ -784,19 +813,26 @@ class VisionPipeline:
         H, W = gray.shape
 
         self.mask = None
-        self.centroid = (-1.0, -1.0)
+        self.components = []
+        self.selected_mask = None
+
+        self.track_positions = {}
+        self.raw_detections = []
+
+        raw_centroid = (-1.0, -1.0)
+        raw_area = 0
 
         if self.mode != "template":
             self.boxes = np.empty((0, 4), dtype=np.float64)
             self.scores = np.empty((0,), dtype=np.float64)
 
         # -------------------------------------------------------------------
-        # Colour tracking
+        # Colour tracking.
         # -------------------------------------------------------------------
         if self.mode == "color":
             hsv = rgb_to_hsv(rgb)
 
-            mask = hsv_mask_wrapped(
+            mask = color_mask_hue_wrap(
                 hsv,
                 self.lower_bound,
                 self.upper_bound,
@@ -805,10 +841,28 @@ class VisionPipeline:
             mask = self._clean_mask(mask)
 
             self.mask = mask
-            self.centroid = calculate_centroid(mask)
+
+            props, selected_mask = self._component_detections(mask, rgb)
+
+            self.components = props
+            self.selected_mask = selected_mask
+
+            if props:
+                raw_centroid = props[0]["centroid"]
+                raw_area = props[0]["pixel_area"]
+
+                detections = [p["centroid"] for p in props]
+                self.raw_detections = detections
+
+                if self.multi_object and self.use_kalman:
+                    self.track_positions = self.multi_tracker.update(detections)
+                elif self.multi_object:
+                    self.track_positions = {
+                        i + 1: det for i, det in enumerate(detections)
+                    }
 
         # -------------------------------------------------------------------
-        # Motion tracking
+        # Motion tracking.
         # -------------------------------------------------------------------
         elif self.mode == "motion":
             if self.prev_gray is None or self.prev_gray.shape != gray.shape:
@@ -825,10 +879,28 @@ class VisionPipeline:
                 mask = self._clean_mask(mask)
 
                 self.mask = mask
-                self.centroid = calculate_centroid(mask)
+
+                props, selected_mask = self._component_detections(mask, rgb)
+
+                self.components = props
+                self.selected_mask = selected_mask
+
+                if props:
+                    raw_centroid = props[0]["centroid"]
+                    raw_area = props[0]["pixel_area"]
+
+                    detections = [p["centroid"] for p in props]
+                    self.raw_detections = detections
+
+                    if self.multi_object and self.use_kalman:
+                        self.track_positions = self.multi_tracker.update(detections)
+                    elif self.multi_object:
+                        self.track_positions = {
+                            i + 1: det for i, det in enumerate(detections)
+                        }
 
         # -------------------------------------------------------------------
-        # Template detection
+        # Template detection.
         # -------------------------------------------------------------------
         elif self.mode == "template":
             if (
@@ -846,16 +918,30 @@ class VisionPipeline:
 
                 if run_detection:
                     try:
-                        ncc_map = match_template_ncc(gray, self.template)
+                        if self.use_multiscale:
+                            self.boxes, self.scores = match_template_ncc_multiscale(
+                                gray,
+                                self.template,
+                                levels=self.multiscale_levels,
+                                threshold=self.detection_threshold,
+                                nms_iou=0.3,
+                            )
+                        else:
+                            ncc_map = match_template_ncc(gray, self.template)
 
-                        self.boxes, self.scores = find_template_matches(
-                            ncc_map=ncc_map,
-                            template_shape=self.template.shape,
-                            threshold=self.detection_threshold,
-                            nms_iou=0.3,
-                        )
+                            self.boxes, self.scores = find_template_matches(
+                                ncc_map=ncc_map,
+                                template_shape=self.template.shape,
+                                threshold=self.detection_threshold,
+                                nms_iou=0.3,
+                            )
 
                         self.last_error = ""
+
+                    except MemoryError as exc:
+                        self.last_error = str(exc)
+                        self.boxes = np.empty((0, 4), dtype=np.float64)
+                        self.scores = np.empty((0,), dtype=np.float64)
 
                     except Exception as exc:
                         self.last_error = str(exc)
@@ -863,16 +949,89 @@ class VisionPipeline:
                         self.scores = np.empty((0,), dtype=np.float64)
 
                 if len(self.boxes) > 0:
-                    y1, x1, y2, x2 = self.boxes[0]
-                    self.centroid = (
-                        float((x1 + x2) * 0.5),
-                        float((y1 + y2) * 0.5),
+                    centres = []
+
+                    for box in self.boxes:
+                        y1, x1, y2, x2 = box
+                        centres.append(
+                            (
+                                float((x1 + x2) * 0.5),
+                                float((y1 + y2) * 0.5),
+                            )
+                        )
+
+                    self.raw_detections = centres
+
+                    raw_centroid = centres[0]
+                    raw_area = int(
+                        max(1.0, float(self.boxes[0][3] - self.boxes[0][1]))
+                        * max(1.0, float(self.boxes[0][2] - self.boxes[0][0]))
                     )
+
+                    if self.multi_object and self.use_kalman:
+                        self.track_positions = self.multi_tracker.update(centres)
+                    elif self.multi_object:
+                        self.track_positions = {
+                            i + 1: det for i, det in enumerate(centres)
+                        }
+
+                else:
+                    if self.multi_object and self.use_kalman:
+                        self.track_positions = self.multi_tracker.update([])
 
         else:
             raise ValueError(f"Unknown pipeline mode: {self.mode}")
 
+        # -------------------------------------------------------------------
+        # Single-object Kalman smoothing / prediction.
+        # -------------------------------------------------------------------
+        if not self.multi_object:
+            if raw_centroid[0] >= 0 and raw_centroid[1] >= 0:
+                self.lost_frames = 0
+
+                if self.use_kalman:
+                    confidence = confidence_from_area(raw_area, H, W)
+
+                    smoothed = self.single_tracker.update(
+                        raw_centroid,
+                        dt=1.0,
+                        confidence=confidence,
+                    )
+
+                    self.centroid = (float(smoothed[0]), float(smoothed[1]))
+                else:
+                    self.centroid = (float(raw_centroid[0]), float(raw_centroid[1]))
+
+            else:
+                self.lost_frames += 1
+
+                if self.use_kalman and self.lost_frames <= 60:
+                    predicted = self.single_tracker.predict(dt=1.0)
+
+                    if predicted[0] >= 0 and predicted[1] >= 0:
+                        self.centroid = (float(predicted[0]), float(predicted[1]))
+                    else:
+                        self.centroid = (-1.0, -1.0)
+                else:
+                    if self.lost_frames > 60:
+                        self.single_tracker.reset()
+
+                    self.centroid = (-1.0, -1.0)
+
+        else:
+            # In multi-object mode, keep the largest raw detection as a
+            # convenience centroid for object classification/HUD.
+            self.centroid = (
+                float(raw_centroid[0]),
+                float(raw_centroid[1]),
+            ) if raw_centroid[0] >= 0 else (-1.0, -1.0)
+
         self.prev_gray = gray
+
+        # -------------------------------------------------------------------
+        # Bounding-box extraction and classification.
+        # -------------------------------------------------------------------
+        self._update_object_info(rgb, gray)
 
         return self
 
@@ -880,14 +1039,7 @@ class VisionPipeline:
 # ---------------------------------------------------------------------------
 # Pygame drawing helpers
 # ---------------------------------------------------------------------------
-def draw_boxes_pygame(
-    screen,
-    boxes: np.ndarray,
-    sx: float,
-    sy: float,
-    color: tuple[int, int, int] = (255, 255, 0),
-    width: int = 2,
-) -> None:
+def draw_boxes_pygame(screen, boxes, sx, sy, color=(255, 255, 0), width=2):
     for box in boxes:
         y1, x1, y2, x2 = map(float, box)
 
@@ -901,15 +1053,7 @@ def draw_boxes_pygame(
         pygame.draw.rect(screen, color, rect, width)
 
 
-def draw_cross_pygame(
-    screen,
-    centroid: tuple[float, float],
-    sx: float,
-    sy: float,
-    color: tuple[int, int, int] = (255, 255, 255),
-    radius: int = 8,
-    width: int = 2,
-) -> None:
+def draw_cross_pygame(screen, centroid, sx, sy, color=(255, 255, 255), radius=8, width=2):
     cx, cy = centroid
 
     if cx < 0 or cy < 0:
@@ -922,7 +1066,21 @@ def draw_cross_pygame(
     pygame.draw.line(screen, color, (x, y - radius), (x, y + radius), width)
 
 
-def draw_hud_pygame(screen, font, lines: list[tuple[str, tuple[int, int, int]]]) -> None:
+def draw_tracks_pygame(screen, track_positions, sx, sy, font, color=(0, 255, 160)):
+    for tid, (x, y) in track_positions.items():
+        if x < 0 or y < 0:
+            continue
+
+        px = int(x * sx)
+        py = int(y * sy)
+
+        pygame.draw.circle(screen, color, (px, py), 5, 1)
+
+        label = font.render(str(tid), True, color)
+        screen.blit(label, (px + 6, py - 8))
+
+
+def draw_hud_pygame(screen, font, lines):
     y = 4
 
     for text, color in lines:
@@ -934,7 +1092,7 @@ def draw_hud_pygame(screen, font, lines: list[tuple[str, tuple[int, int, int]]])
 # ---------------------------------------------------------------------------
 # Headless runner
 # ---------------------------------------------------------------------------
-def run_headless(args: argparse.Namespace) -> int:
+def run_headless(args):
     try:
         source = make_source(
             source=args.source,
@@ -955,28 +1113,44 @@ def run_headless(args: argparse.Namespace) -> int:
         detection_threshold=args.detection_threshold,
         motion_threshold=args.motion_threshold,
         detect_every=args.detect_every,
-        use_morphology=True,
+        use_morphology=not args.no_morphology,
+        enable_kalman=not args.no_kalman,
+        enable_object_info=not args.no_object_info,
+        multi_object=args.multi,
+        use_multiscale=args.multiscale,
+        multiscale_levels=args.multiscale_levels,
+        feature_counts=args.feature_counts,
+        process_noise=args.process_noise,
+        measurement_noise=args.measurement_noise,
+        gate_threshold=args.gate,
+        min_area=args.min_area,
+        max_match_distance=args.max_match_distance,
+        max_missed=args.max_missed,
     )
 
     try:
         for i in range(args.headless_frames):
-            rgb = source.read()
+            frame, timestamp = source.read()
 
-            if rgb is None:
+            if frame is None:
                 print("Source returned no frame.")
                 break
 
-            pipeline.process(rgb)
+            pipeline.process(frame, timestamp)
 
             if i % max(1, args.headless_print_every) == 0:
                 cx, cy = pipeline.centroid
+                label = pipeline.object_label if pipeline.object_label else "-"
 
                 print(
                     f"frame={i:04d} "
                     f"mode={pipeline.mode:<8} "
                     f"proc_size={pipeline.gray.shape[1]}x{pipeline.gray.shape[0]} "
                     f"centroid=({cx:7.2f},{cy:7.2f}) "
-                    f"boxes={len(pipeline.boxes)}"
+                    f"components={len(pipeline.components):02d} "
+                    f"tracks={len(pipeline.track_positions):02d} "
+                    f"kalman={int(pipeline.use_kalman)} "
+                    f"label={label}"
                 )
 
     except KeyboardInterrupt:
@@ -991,7 +1165,7 @@ def run_headless(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # GUI runner
 # ---------------------------------------------------------------------------
-def run_gui(args: argparse.Namespace) -> int:
+def run_gui(args):
     if not PYGAME_AVAILABLE:
         print("pygame is required for the graphical live demo.")
         print("Install it with:")
@@ -1022,17 +1196,29 @@ def run_gui(args: argparse.Namespace) -> int:
         detection_threshold=args.detection_threshold,
         motion_threshold=args.motion_threshold,
         detect_every=args.detect_every,
-        use_morphology=True,
+        use_morphology=not args.no_morphology,
+        enable_kalman=not args.no_kalman,
+        enable_object_info=not args.no_object_info,
+        multi_object=args.multi,
+        use_multiscale=args.multiscale,
+        multiscale_levels=args.multiscale_levels,
+        feature_counts=args.feature_counts,
+        process_noise=args.process_noise,
+        measurement_noise=args.measurement_noise,
+        gate_threshold=args.gate,
+        min_area=args.min_area,
+        max_match_distance=args.max_match_distance,
+        max_missed=args.max_missed,
     )
 
     try:
-        first_frame = source.read()
+        first_frame, first_timestamp = source.read()
 
         if first_frame is None:
             print("Could not read the first frame from the source.")
             return 1
 
-        pipeline.process(first_frame)
+        pipeline.process(first_frame, first_timestamp)
 
         pygame.init()
         pygame.display.init()
@@ -1042,7 +1228,7 @@ def run_gui(args: argparse.Namespace) -> int:
         scale = max(1, int(args.display_scale))
 
         screen = pygame.display.set_mode((int(W * scale), int(H * scale)))
-        pygame.display.set_caption("mycv live demo")
+        pygame.display.set_caption("mycv live demo v4.1")
 
         clock = pygame.time.Clock()
         font = pygame.font.Font(None, 20)
@@ -1071,16 +1257,16 @@ def run_gui(args: argparse.Namespace) -> int:
                         running = False
 
                     elif event.key == pygame.K_c:
-                        pipeline.mode = "color"
+                        pipeline.set_mode("color")
 
                     elif event.key == pygame.K_m:
-                        pipeline.mode = "motion"
+                        pipeline.set_mode("motion")
 
                     elif event.key == pygame.K_d:
-                        pipeline.mode = "template"
+                        pipeline.set_mode("template")
 
                     elif event.key == pygame.K_t:
-                        pipeline.mode = "template"
+                        pipeline.set_mode("template")
                         pipeline.capture_template()
 
                     elif event.key == pygame.K_s:
@@ -1098,11 +1284,32 @@ def run_gui(args: argparse.Namespace) -> int:
                     elif event.key == pygame.K_y:
                         pipeline.set_color_preset("yellow")
 
+                    elif event.key == pygame.K_k:
+                        pipeline.use_kalman = not pipeline.use_kalman
+                        pipeline.single_tracker.reset()
+                        pipeline.multi_tracker.reset()
+                        pipeline.lost_frames = 0
+
+                    elif event.key == pygame.K_u:
+                        pipeline.multi_object = not pipeline.multi_object
+                        pipeline.single_tracker.reset()
+                        pipeline.multi_tracker.reset()
+                        pipeline.track_positions = {}
+
+                    elif event.key == pygame.K_i:
+                        pipeline.show_object_info = not pipeline.show_object_info
+
                     elif event.key == pygame.K_o:
                         overlay = not overlay
 
                     elif event.key == pygame.K_p:
                         pipeline.use_morphology = not pipeline.use_morphology
+
+                    elif event.key == pygame.K_f:
+                        pipeline.feature_counts = not pipeline.feature_counts
+
+                    elif event.key == pygame.K_n:
+                        pipeline.use_multiscale = not pipeline.use_multiscale
 
                     elif event.key in (pygame.K_EQUALS,):
                         pipeline.detection_threshold = min(
@@ -1143,13 +1350,13 @@ def run_gui(args: argparse.Namespace) -> int:
                     elif event.key == pygame.K_h:
                         print(HELP_TEXT)
 
-            rgb = source.read()
+            frame, timestamp = source.read()
 
-            if rgb is None:
+            if frame is None:
                 print("Source returned no frame. Exiting.")
                 break
 
-            pipeline.process(rgb)
+            pipeline.process(frame, timestamp)
 
             if pipeline.gray is None:
                 continue
@@ -1158,11 +1365,11 @@ def run_gui(args: argparse.Namespace) -> int:
                 H, W = pipeline.gray.shape
                 screen = pygame.display.set_mode((int(W * scale), int(H * scale)))
 
-            vis = pipeline.display_rgb
+            # Always copy because draw_bounding_box writes in-place.
+            vis = pipeline.display_rgb.copy()
 
             # Optional red mask overlay.
             if overlay and pipeline.mask is not None and pipeline.mask.shape == vis.shape[:2]:
-                vis = vis.copy()
                 idx = pipeline.mask > 0
 
                 if np.any(idx):
@@ -1172,6 +1379,18 @@ def run_gui(args: argparse.Namespace) -> int:
                         0,
                         255,
                     ).astype(np.uint8)
+
+            # Draw selected object bounding box using mycv.features.draw_bounding_box.
+            if pipeline.show_object_info and pipeline.object_bbox is not None:
+                try:
+                    draw_bounding_box(
+                        vis,
+                        pipeline.object_bbox,
+                        color=(0, 255, 255),
+                        thickness=2,
+                    )
+                except Exception:
+                    pass
 
             frame_surface = pygame.image.frombuffer(
                 np.ascontiguousarray(vis).tobytes(),
@@ -1185,21 +1404,60 @@ def run_gui(args: argparse.Namespace) -> int:
             sx = screen.get_width() / float(W)
             sy = screen.get_height() / float(H)
 
-            if pipeline.mode == "template" and len(pipeline.boxes) > 0:
-                draw_boxes_pygame(screen, pipeline.boxes, sx, sy)
+            # Draw component boxes for mask-based multi-object tracking.
+            if pipeline.mode in {"color", "motion"} and pipeline.show_object_info:
+                for prop in pipeline.components:
+                    y1, x1, y2, x2 = prop["bbox"]
 
-            draw_cross_pygame(
-                screen,
-                pipeline.centroid,
-                sx,
-                sy,
-                color=(255, 255, 255),
-            )
+                    rect = pygame.Rect(
+                        int(x1 * sx),
+                        int(y1 * sy),
+                        int((x2 - x1) * sx),
+                        int((y2 - y1) * sy),
+                    )
+
+                    pygame.draw.rect(screen, (0, 220, 120), rect, 1)
+
+            # Template mode: draw all detection boxes lightly.
+            if pipeline.mode == "template" and len(pipeline.boxes) > 0:
+                draw_boxes_pygame(
+                    screen,
+                    pipeline.boxes,
+                    sx,
+                    sy,
+                    color=(255, 255, 0),
+                    width=1,
+                )
+
+            # Draw tracks or single centroid.
+            if pipeline.multi_object and pipeline.track_positions:
+                draw_tracks_pygame(screen, pipeline.track_positions, sx, sy, font)
+
+            elif not pipeline.multi_object:
+                draw_cross_pygame(
+                    screen,
+                    pipeline.centroid,
+                    sx,
+                    sy,
+                    color=(255, 255, 255),
+                )
 
             # Centre sampling marker.
             centre_x = int((W // 2) * sx)
             centre_y = int((H // 2) * sy)
             pygame.draw.circle(screen, (0, 255, 255), (centre_x, centre_y), 3, 1)
+
+            # Draw classification label near bounding box.
+            if pipeline.show_object_info and pipeline.object_label and pipeline.object_bbox is not None:
+                label_surf = font.render(pipeline.object_label, True, (0, 255, 255))
+
+                label_x = int(pipeline.object_bbox[1] * sx)
+                label_y = int(pipeline.object_bbox[0] * sy) - 18
+
+                if label_y < 0:
+                    label_y = int(pipeline.object_bbox[0] * sy) + 4
+
+                screen.blit(label_surf, (label_x, label_y))
 
             template_shape = (
                 "None"
@@ -1214,10 +1472,19 @@ def run_gui(args: argparse.Namespace) -> int:
                 ),
                 (
                     f"centroid:({pipeline.centroid[0]:6.1f},{pipeline.centroid[1]:6.1f})  "
-                    f"morph:{int(pipeline.use_morphology)}  overlay:{int(overlay)}",
+                    f"kalman:{int(pipeline.use_kalman)}  multi:{int(pipeline.multi_object)}  "
+                    f"obj_info:{int(pipeline.show_object_info)}",
                     (0, 255, 140),
                 ),
             ]
+
+            if pipeline.object_label:
+                hud_lines.append(
+                    (
+                        f"object: {pipeline.object_label}",
+                        (0, 255, 255),
+                    )
+                )
 
             if pipeline.mode == "color":
                 hud_lines.append(
@@ -1241,8 +1508,17 @@ def run_gui(args: argparse.Namespace) -> int:
                 hud_lines.append(
                     (
                         f"thr:{pipeline.detection_threshold:4.2f}  matches:{len(pipeline.boxes)}  "
-                        f"template:{template_shape}  detect_every:{pipeline.detect_every}",
+                        f"multi-scale:{int(pipeline.use_multiscale)}  template:{template_shape}",
                         (255, 255, 140),
+                    )
+                )
+
+            if pipeline.mode in {"color", "motion"}:
+                hud_lines.append(
+                    (
+                        f"components:{len(pipeline.components)}  tracks:{len(pipeline.track_positions)}  "
+                        f"min_area:{pipeline.min_area}",
+                        (180, 255, 180),
                     )
                 )
 
@@ -1256,14 +1532,14 @@ def run_gui(args: argparse.Namespace) -> int:
 
             hud_lines.append(
                 (
-                    "q:quit c:color m:motion t:template s:sample g/r/b/y presets o:overlay p:morph",
+                    "q:quit c:color m:motion t:template s:sample g/r/b/y presets",
                     (190, 190, 190),
                 )
             )
 
             hud_lines.append(
                 (
-                    "=/-:det thr  [ ]:motion thr  left/right:template size  h:help",
+                    "k:kalman u:multi i:object o:overlay p:morph f:features n:multiscale h:help",
                     (190, 190, 190),
                 )
             )
@@ -1310,9 +1586,9 @@ def run_gui(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(
-        description="mycv live tracking and detection demo.",
+        description="mycv v4.1 live tracking, detection, classification, and Kalman demo.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1322,8 +1598,7 @@ def main() -> int:
         default="synthetic",
         help=(
             "Frame source. Use synthetic, camera, an integer camera index, "
-            "a video-file path, or an FFmpeg device string such as "
-            "'dshow:video=Integrated Camera'."
+            "a video-file path, a network stream URL, or an FFmpeg device string."
         ),
     )
 
@@ -1343,10 +1618,7 @@ def main() -> int:
         "--max-dim",
         type=int,
         default=180,
-        help=(
-            "Maximum processed image dimension. Frames are downscaled to this "
-            "size before tracking/detection to keep NCC tractable."
-        ),
+        help="Maximum processed image dimension.",
     )
 
     parser.add_argument(
@@ -1388,13 +1660,98 @@ def main() -> int:
         "--detect-every",
         type=int,
         default=1,
-        help="Run template detection every N frames. Increase for performance.",
+        help="Run template detection every N frames.",
+    )
+
+    parser.add_argument(
+        "--no-morphology",
+        action="store_true",
+        help="Disable morphological cleanup at startup.",
+    )
+
+    parser.add_argument(
+        "--no-kalman",
+        action="store_true",
+        help="Disable Kalman filtering at startup.",
+    )
+
+    parser.add_argument(
+        "--no-object-info",
+        action="store_true",
+        help="Disable bounding-box and classification overlay at startup.",
+    )
+
+    parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="Start in multi-object tracking mode.",
+    )
+
+    parser.add_argument(
+        "--multiscale",
+        action="store_true",
+        help="Start with multi-scale template matching enabled.",
+    )
+
+    parser.add_argument(
+        "--multiscale-levels",
+        type=int,
+        default=3,
+        help="Number of pyramid levels for multi-scale template matching.",
+    )
+
+    parser.add_argument(
+        "--feature-counts",
+        action="store_true",
+        help="Enable Harris corner count and Hough line count in object metrics.",
+    )
+
+    parser.add_argument(
+        "--process-noise",
+        type=float,
+        default=1e-2,
+        help="Kalman process noise variance.",
+    )
+
+    parser.add_argument(
+        "--measurement-noise",
+        type=float,
+        default=1e-1,
+        help="Kalman measurement noise variance.",
+    )
+
+    parser.add_argument(
+        "--gate",
+        type=float,
+        default=0.0,
+        help="Mahalanobis gating threshold for single-object Kalman. 0 disables gating. A common 2-D value is 9.21.",
+    )
+
+    parser.add_argument(
+        "--min-area",
+        type=int,
+        default=20,
+        help="Minimum connected-component pixel area to keep.",
+    )
+
+    parser.add_argument(
+        "--max-match-distance",
+        type=float,
+        default=50.0,
+        help="Maximum association distance for multi-object Kalman tracking.",
+    )
+
+    parser.add_argument(
+        "--max-missed",
+        type=int,
+        default=5,
+        help="Maximum missed frames before a multi-object track is deleted.",
     )
 
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run without a GUI window. Useful for SSH or debugging.",
+        help="Run without a GUI window.",
     )
 
     parser.add_argument(

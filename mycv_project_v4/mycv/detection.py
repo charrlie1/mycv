@@ -33,6 +33,39 @@ import numpy as np
 #  Internal helpers
 # ---------------------------------------------------------------------------
 
+def _check_patch_memory(H_out: int, W_out: int, kH: int, kW: int,
+                          itemsize: int = 8, limit_gb: float = 2.0) -> None:
+    """
+    Guard against unbounded memory use in `match_template_ncc`.
+
+    `_extract_patches` itself is zero-copy (as_strided), but the local
+    statistics reductions (`.mean`, `.std`, elementwise product with the
+    template) materialise full (H_out, W_out, kH, kW) temporaries. For a
+    large frame and/or large template this can be very large — e.g. a
+    1920x1080 frame with a 200x200 template is ~(1721*881*200*200*8) bytes
+    = ~485 GB for a single float64 temporary. Fail fast with a clear
+    message rather than silently trying to allocate that and OOM-killing
+    the process.
+
+    Parameters
+    ----------
+    H_out, W_out : int  output map dimensions
+    kH, kW       : int  template dimensions
+    itemsize     : int  bytes per element (8 for float64)
+    limit_gb     : float  maximum allowed size, in GiB, for one temporary
+    """
+    n_bytes = H_out * W_out * kH * kW * itemsize
+    limit_bytes = limit_gb * (1024 ** 3)
+    if n_bytes > limit_bytes:
+        raise MemoryError(
+            f"match_template_ncc would materialise a "
+            f"{n_bytes / (1024**3):.2f} GiB patch temporary "
+            f"(limit {limit_gb} GiB). Downscale the frame/template, "
+            f"restrict the search to a region of interest, or use "
+            f"match_template_ncc_multiscale to search coarser pyramid "
+            f"levels first."
+        )
+
 def _make_gaussian_kernel5() -> np.ndarray:
     """
     Return the standard 5x5 separable Gaussian kernel (sigma ~ 1.0).
@@ -78,6 +111,7 @@ def _extract_patches(image: np.ndarray, kH: int, kW: int) -> np.ndarray:
 def match_template_ncc(
     image: np.ndarray,
     template: np.ndarray,
+    max_memory_gb: float = 2.0,
 ) -> np.ndarray:
     """
     Compute the Normalised Cross-Correlation (NCC) response map between a
@@ -121,9 +155,14 @@ def match_template_ncc(
 
     Parameters
     ----------
-    image    : np.ndarray  shape (H, W), dtype uint8 or float
-    template : np.ndarray  shape (kH, kW), dtype uint8 or float
-               Must satisfy kH <= H and kW <= W.
+    image         : np.ndarray  shape (H, W), dtype uint8 or float
+    template      : np.ndarray  shape (kH, kW), dtype uint8 or float
+                    Must satisfy kH <= H and kW <= W.
+    max_memory_gb : float  memory ceiling (GiB) for the internal patch
+                    temporaries; raises MemoryError above this (see
+                    `_check_patch_memory`). Set higher for large deliberate
+                    searches, or use `match_template_ncc_multiscale` /
+                    a region of interest instead of raising the limit.
 
     Returns
     -------
@@ -140,6 +179,8 @@ def match_template_ncc(
         raise ValueError(
             f"Template ({kH}x{kW}) cannot be larger than image ({H}x{W})."
         )
+
+    _check_patch_memory(H - kH + 1, W - kW + 1, kH, kW, limit_gb=max_memory_gb)
 
     img = image.astype(np.float64)
     tpl = template.astype(np.float64)
@@ -165,7 +206,8 @@ def match_template_ncc(
     denom = s_P * s_T
 
     # Guard: if denominator is (near) zero, the patch is flat -> NCC = 0
-    ncc = np.where(denom < 1e-10, 0.0, cross_cov / denom)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ncc = np.where(denom < 1e-10, 0.0, cross_cov / denom)
 
     return np.clip(ncc, -1.0, 1.0)
 
@@ -375,3 +417,89 @@ def non_max_suppression(
 
     kept_idx = np.array(kept, dtype=np.int64)
     return boxes[kept_idx], scores[kept_idx]
+
+
+# ---------------------------------------------------------------------------
+#  4. Multi-Scale Template Matching (Gaussian pyramid + NCC + global NMS)
+# ---------------------------------------------------------------------------
+
+def match_template_ncc_multiscale(
+    image: np.ndarray,
+    template: np.ndarray,
+    levels: int = 4,
+    threshold: float = 0.6,
+    nms_iou: float = 0.3,
+) -> tuple:
+    """
+    Scale-invariant template matching: search a Gaussian pyramid of the
+    image with a single template, then merge all detections with NMS.
+
+    Why this is needed
+    --------------------
+    `match_template_ncc` only matches objects at approximately the same
+    scale as the template — if the object appears larger or smaller in
+    the frame, NCC drops sharply even for a perfect shape/colour match.
+    Building a Gaussian pyramid of the *image* and matching the same
+    template at every level effectively searches over object scale
+    without needing to resize the template itself.
+
+    Algorithm
+    ---------
+    1. Build pyramid levels I_0 (original), I_1 (half-res), I_2, ...
+       via `gaussian_pyramid` (blur-then-decimate, alias-free).
+    2. At each level k, run `match_template_ncc` + `find_template_matches`
+       (per-level NMS) to get candidate boxes in that level's coordinates.
+    3. Map boxes back to full-resolution coordinates: a box detected at
+       level k with downsample factor 2^k is scaled by 2^k.
+    4. Pool all levels' boxes/scores and run one final global
+       `non_max_suppression` pass to remove duplicate detections of the
+       same object found at adjacent scales.
+
+    This is the direct (exhaustive) multi-scale strategy. For faster
+    search, a coarse-to-fine variant would search only the best
+    coarse-level region at each finer level instead of the whole frame —
+    left as a straightforward extension using the same building blocks.
+
+    Parameters
+    ----------
+    image     : np.ndarray  shape (H, W), uint8 or float — search image
+    template  : np.ndarray  shape (kH, kW), uint8 or float — fixed-scale template
+    levels    : int    number of pyramid levels (including level 0)
+    threshold : float  minimum NCC score to keep a per-level candidate
+    nms_iou   : float  IoU threshold for both per-level and the final
+                cross-scale NMS pass
+
+    Returns
+    -------
+    boxes  : np.ndarray  shape (M, 4)  [y1, x1, y2, x2] in ORIGINAL image
+             coordinates (exclusive bottom-right convention)
+    scores : np.ndarray  shape (M,)    corresponding NCC scores
+    """
+    pyramid = gaussian_pyramid(image, levels=levels)
+    kH, kW  = template.shape
+
+    all_boxes  = []
+    all_scores = []
+
+    for level, img_level in enumerate(pyramid):
+        if img_level.shape[0] < kH or img_level.shape[1] < kW:
+            break  # image too small at this scale to hold the template
+
+        ncc_map = match_template_ncc(img_level, template)
+        boxes, scores = find_template_matches(
+            ncc_map, template.shape, threshold=threshold, nms_iou=nms_iou,
+        )
+        if len(boxes) == 0:
+            continue
+
+        scale = 2 ** level
+        all_boxes.append(boxes * scale)
+        all_scores.append(scores)
+
+    if not all_boxes:
+        return np.empty((0, 4), dtype=np.float64), np.empty((0,), dtype=np.float64)
+
+    merged_boxes  = np.concatenate(all_boxes, axis=0)
+    merged_scores = np.concatenate(all_scores, axis=0)
+
+    return non_max_suppression(merged_boxes, merged_scores, iou_threshold=nms_iou)
