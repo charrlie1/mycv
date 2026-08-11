@@ -11,7 +11,8 @@ color     : Photometrics     — histogram_equalize, rgb_to_hsv
 filters   : Spatial filters  — convolve2d, sobel_edge_detection
 morphology: Binary set ops   — dilate, erode, opening, closing
 geometry  : Transformations  — rotate_image, warp_perspective, bilinear_interpolate
-features  : Feature extract  — harris_corner_response, hough_line_transform
+features  : Feature extract  — harris_corner_response, hough_line_transform,
+                               extract_object_metrics, draw_bounding_box, classify_object
 detection : Detection        — match_template_ncc, gaussian_pyramid, non_max_suppression
 tracking  : Motion & tracking — compute_motion_mask, color_mask,
                                 calculate_centroid, TemporalSmoother
@@ -22,7 +23,10 @@ from .color      import histogram_equalize, rgb_to_hsv
 from .filters    import convolve2d, sobel_edge_detection, SOBEL_X, SOBEL_Y
 from .morphology import dilate, erode, opening, closing
 from .geometry   import bilinear_interpolate, rotate_image, warp_perspective
-from .features   import harris_corner_response, hough_line_transform
+from .features   import (
+    harris_corner_response, hough_line_transform,
+    extract_object_metrics, draw_bounding_box, classify_object,
+)
 from .detection  import (
     match_template_ncc, find_template_matches,
     gaussian_pyramid, non_max_suppression,
@@ -45,6 +49,7 @@ __all__ = [
     "dilate", "erode", "opening", "closing",
     "bilinear_interpolate", "rotate_image", "warp_perspective",
     "harris_corner_response", "hough_line_transform",
+    "extract_object_metrics", "draw_bounding_box", "classify_object",
     "match_template_ncc", "find_template_matches",
     "gaussian_pyramid", "non_max_suppression",
     "compute_motion_mask",

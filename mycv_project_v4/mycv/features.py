@@ -7,6 +7,9 @@ Functions
 ---------
 harris_corner_response : Structure-tensor corner scoring map R(x,y)
 hough_line_transform   : Polar-space accumulator array for line detection
+extract_object_metrics : Morphological bounding-box and shape metrics
+draw_bounding_box      : In-place rectangle drawing on RGB arrays
+classify_object        : Deterministic color+shape object classification
 """
 
 import numpy as np
@@ -203,3 +206,188 @@ def hough_line_transform(
         "rhos": rho_bins,
         "lines": lines,
     }
+
+
+# ---------------------------------------------------------------------------
+#  Morphological Feature Extraction and Object Classification
+# ---------------------------------------------------------------------------
+
+def extract_object_metrics(binary_mask: np.ndarray) -> dict | None:
+    """
+    Extract morphological metrics from a binary mask.
+
+    Uses np.where to find all non-zero pixels and determines the absolute
+    minimum and maximum coordinates to form the bounding box.
+
+    Parameters
+    ----------
+    binary_mask : np.ndarray
+        2D binary mask (uint8 or bool) where non-zero pixels represent objects.
+
+    Returns
+    -------
+    dict or None
+        Dictionary with keys: 'bbox', 'width', 'height', 'area', 'aspect_ratio'
+        Returns None if the mask is completely empty (no non-zero pixels).
+
+        - bbox: tuple (y1, x1, y2, x2) — top-left and bottom-right corners
+        - width: int — bounding box width (x2 - x1)
+        - height: int — bounding box height (y2 - y1)
+        - area: int — bounding box area (width * height)
+        - aspect_ratio: float — width / height (0.0 if height is 0)
+    """
+    # Find all non-zero pixel coordinates
+    ys, xs = np.where(binary_mask > 0)
+
+    # Handle empty mask edge case
+    if len(ys) == 0 or len(xs) == 0:
+        return None
+
+    # Compute bounding box from min/max coordinates
+    y1 = int(np.min(ys))
+    y2 = int(np.max(ys))
+    x1 = int(np.min(xs))
+    x2 = int(np.max(xs))
+
+    bbox = (y1, x1, y2, x2)
+
+    # Calculate dimensions
+    width = x2 - x1
+    height = y2 - y1
+
+    # Calculate area
+    area = width * height
+
+    # Calculate aspect ratio with safe division-by-zero handling
+    if height == 0:
+        aspect_ratio = 0.0
+    else:
+        aspect_ratio = width / height
+
+    return {
+        "bbox": bbox,
+        "width": width,
+        "height": height,
+        "area": area,
+        "aspect_ratio": aspect_ratio,
+    }
+
+
+def draw_bounding_box(
+    image: np.ndarray,
+    bbox: tuple,
+    color: tuple = (255, 0, 0),
+    thickness: int = 2
+) -> None:
+    """
+    Draw a rectangle on an RGB image in-place using pure NumPy slicing.
+
+    No loops are used. The function overwrites exact pixel values at the
+    borders of the bounding box based on the given thickness.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        3D RGB NumPy array of shape (H, W, 3), modified in-place.
+    bbox : tuple
+        Bounding box as (y1, x1, y2, x2) — top-left and bottom-right corners.
+    color : tuple, optional
+        RGB color values (default: (255, 0, 0) — red).
+    thickness : int, optional
+        Line thickness in pixels (default: 2).
+    """
+    y1, x1, y2, x2 = bbox
+    H, W = image.shape[:2]
+
+    # Convert color to array for broadcasting
+    color_arr = np.array(color, dtype=image.dtype)
+
+    # Clamp bounding box to image bounds
+    y1 = max(0, y1)
+    x1 = max(0, x1)
+    y2 = min(H - 1, y2)
+    x2 = min(W - 1, x2)
+
+    # Draw top horizontal border
+    image[y1:y1 + thickness, x1:x2 + 1] = color_arr
+
+    # Draw bottom horizontal border
+    image[y2 - thickness + 1:y2 + 1, x1:x2 + 1] = color_arr
+
+    # Draw left vertical border
+    image[y1:y2 + 1, x1:x1 + thickness] = color_arr
+
+    # Draw right vertical border
+    image[y1:y2 + 1, x2 - thickness + 1:x2 + 1] = color_arr
+
+
+def classify_object(image: np.ndarray, metrics_dict: dict) -> str:
+    """
+    Classify an object based on color and shape.
+
+    Crops the original RGB image using the bounding box coordinates,
+    calculates the mean RGB value, and finds the closest target color
+    using vectorized Euclidean distance. Shape is classified based on
+    aspect ratio.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Original RGB image as a 3D NumPy array of shape (H, W, 3).
+    metrics_dict : dict
+        Dictionary from extract_object_metrics containing 'bbox' and 'aspect_ratio'.
+
+    Returns
+    -------
+    str
+        Combined classification string, e.g., 'Blue Rectangle', 'Red Square'.
+        Returns 'Unknown' if metrics_dict is None or invalid.
+    """
+    if metrics_dict is None or "bbox" not in metrics_dict:
+        return "Unknown"
+
+    bbox = metrics_dict["bbox"]
+    y1, x1, y2, x2 = bbox
+
+    # Crop the ROI from the original image
+    cropped = image[y1:y2 + 1, x1:x2 + 1]
+
+    # Handle empty crop
+    if cropped.size == 0:
+        return "Unknown"
+
+    # Calculate mean RGB value across spatial axes (axis 0 and 1)
+    mean_rgb = np.mean(cropped, axis=(0, 1))
+
+    # Define target colors dictionary
+    target_colors = {
+        "Red": np.array([255, 0, 0], dtype=np.float64),
+        "Green": np.array([0, 255, 0], dtype=np.float64),
+        "Blue": np.array([0, 0, 255], dtype=np.float64),
+        "Yellow": np.array([255, 255, 0], dtype=np.float64),
+        "Black": np.array([0, 0, 0], dtype=np.float64),
+        "White": np.array([255, 255, 255], dtype=np.float64),
+    }
+
+    # Stack target colors into a matrix for vectorized distance calculation
+    color_names = list(target_colors.keys())
+    color_matrix = np.stack([target_colors[name] for name in color_names])
+
+    # Vectorized Euclidean distance: ||mean_rgb - target||_2
+    # distances[i] = sqrt(sum((mean_rgb - color_matrix[i])^2))
+    diff = color_matrix - mean_rgb[np.newaxis, :]
+    distances = np.sqrt(np.sum(diff ** 2, axis=1))
+
+    # Find the index of the minimum distance (closest color)
+    closest_idx = np.argmin(distances)
+    color_name = color_names[closest_idx]
+
+    # Shape classification based on aspect ratio
+    aspect_ratio = metrics_dict.get("aspect_ratio", 1.0)
+
+    if 0.8 <= aspect_ratio <= 1.2:
+        shape_name = "Square"
+    else:
+        shape_name = "Rectangle"
+
+    return f"{color_name} {shape_name}"
